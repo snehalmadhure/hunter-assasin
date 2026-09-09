@@ -28,6 +28,9 @@ Controls (Game)
 """
 
 import sys
+import builtins
+import threading
+import time
 import pygame
 
 from game_map   import GameMap, MAP_WIDTH, MAP_HEIGHT, CELL_SIZE
@@ -43,6 +46,51 @@ from transforms import (
     print_points,
     identity,
 )
+
+
+# ============================================================
+# PYGAME-SAFE INPUT
+#
+# input() blocks Python's main thread, which stops pygame
+# from pumping its event queue — Windows then marks the
+# window as "(Not Responding)" and turns it grey.
+#
+# _pump_events() runs in a daemon thread and calls
+# pygame.event.pump() every ~16 ms so the OS keeps the
+# window alive while the console waits for a keypress.
+#
+# We temporarily replace builtins.input with this wrapper
+# only during the demo, then restore the original.
+# ============================================================
+
+_ORIGINAL_INPUT = builtins.input
+
+
+def _pump_events(stop_event):
+    """Background thread: keep pygame alive during input() blocking."""
+    while not stop_event.is_set():
+        try:
+            pygame.event.pump()
+        except Exception:
+            pass
+        time.sleep(0.016)   # ~60 fps
+
+
+def _demo_input(prompt=""):
+    """
+    Drop-in replacement for input() used during the transformation demo.
+    Spawns a background thread to keep pygame's event loop alive
+    so the window never shows (Not Responding).
+    """
+    stop = threading.Event()
+    t = threading.Thread(target=_pump_events, args=(stop,), daemon=True)
+    t.start()
+
+    result = _ORIGINAL_INPUT(prompt)
+
+    stop.set()
+    t.join(timeout=0.5)
+    return result
 
 
 # ============================================================
@@ -405,8 +453,10 @@ def run_transformation_demo(screen, clock):
 
         screen.fill(BLACK)
 
+        screen.lock()
         draw_original(screen, original_points)
         draw_transformed(screen, transformed_points)
+        screen.unlock()
 
         # Labels
         font = pygame.font.SysFont("Consolas", 14, bold=True)
@@ -476,10 +526,16 @@ def run_game(screen, clock, rep_type):
     enemies[0].patrol_bx = 20.5 * CELL_SIZE
     enemies[0].patrol_by =  5.5 * CELL_SIZE
 
-    enemies[1].patrol_bx =  8.5 * CELL_SIZE
-    enemies[1].patrol_by =  8.5 * CELL_SIZE
+    # Enemy 1: patrol horizontally along row 14 (cols 4.5 <-> 8.5)
+    # Row 14 is a long clear corridor — all cells walkable between these cols.
+    # OLD (broken): col 8 -> row 8 — vertical path crossed 4 wall cells
+    enemies[1].patrol_bx =  4.5 * CELL_SIZE
+    enemies[1].patrol_by = 14.5 * CELL_SIZE
 
-    enemies[2].patrol_bx = 32.5 * CELL_SIZE
+    # Enemy 2: patrol horizontally along row 8 within the valid stretch (cols 22.5 <-> 25.5)
+    # Row 8 has a wall gap at cols 27-29, so patrol stays left of it.
+    # OLD (broken): col 25 -> col 32 — path crossed wall cells at cols 27, 28, 29
+    enemies[2].patrol_bx = 22.5 * CELL_SIZE
     enemies[2].patrol_by =  8.5 * CELL_SIZE
 
     # --------------------------------------------------------
@@ -520,13 +576,17 @@ def run_game(screen, clock, rep_type):
 
         for enemy in enemies:
 
-            enemy.update_patrol(rep_type)
+            enemy.update_patrol(rep_type, game_map)
             enemy.update_rotation(rep_type)
 
             detected = enemy.update_detection(player)
 
             if detected and grace_frames <= 0:
                 player.health = max(0.0, player.health - 0.2)
+
+        # Tell the player whether any enemy is currently watching them.
+        # This flag drives the scaling_matrix pulse in Player.draw().
+        player.is_detected = any(e.is_player_detected for e in enemies)
 
         if grace_frames > 0:
             grace_frames -= 1
@@ -573,13 +633,17 @@ def run_game(screen, clock, rep_type):
         # RENDER
         # ----------------------------------------------------
 
+        # game_map.draw() handles its own lock/unlock internally.
         game_map.draw(screen)
 
+        # Lock once for all entity pixel drawing (Bresenham/circle set_at calls)
+        screen.lock()
         player.draw(screen, rep_type)
-
         for enemy in enemies:
             enemy.draw(screen, rep_type)
+        screen.unlock()
 
+        # HUD uses surface.blit() for text — must be done AFTER unlock
         draw_hud(screen, player, enemies, rep_type)
 
         pygame.display.flip()
@@ -602,12 +666,28 @@ def main():
     clock = pygame.time.Clock()
 
     # --------------------------------------------------------
-    # Column Matrix representation (type 2) used by default.
-    # All transformation matrices in entities.py and
-    # transforms.py remain fully active during gameplay.
+    # STEP 1: Run the interactive 2D Transformation Demo
+    #
+    # This is the pre-game menu (previously dead code).
+    # The user enters polygon points, picks Row/Column
+    # representation, then applies Translation / Scaling /
+    # Rotation / Composite transformations via the console.
+    # The chosen rep_type carries forward into gameplay so
+    # all in-game matrices use the same convention.
     # --------------------------------------------------------
 
-    rep_type = 2
+    # Patch input() so the pygame window stays alive (not grey/frozen)
+    # while the console is waiting for user input.
+    builtins.input = _demo_input
+    try:
+        rep_type = run_transformation_demo(screen, clock)
+    finally:
+        # Always restore the real input(), even if the demo crashes
+        builtins.input = _ORIGINAL_INPUT
+
+    # --------------------------------------------------------
+    # STEP 2: Start the actual game with the chosen rep_type
+    # --------------------------------------------------------
 
     run_game(screen, clock, rep_type)
 

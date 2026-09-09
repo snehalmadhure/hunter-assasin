@@ -32,6 +32,14 @@ class Player:
         # Current transformation label (shown in HUD)
         self.current_transform = "None"
 
+        # Facing angle in degrees — updated each frame from movement direction.
+        # Used by rotation_matrix in draw() to orient the triangle.
+        self.facing_angle = -90.0   # default: pointing UP (screen -y axis)
+
+        # Set True by main loop when any enemy detects the player.
+        # Triggers scaling_matrix pulse in draw().
+        self.is_detected = False
+
 
     # ========================================================
     # UPDATE (MOVEMENT VIA TRANSLATION MATRIX)
@@ -73,6 +81,13 @@ class Player:
             return
 
         self.current_transform = "Translation"
+
+        # -----------------------------------------------
+        # TRACK FACING DIRECTION (for rotation_matrix in draw)
+        # atan2(ty, tx) gives the movement angle so the triangle
+        # rotates to face wherever the player is heading.
+        # -----------------------------------------------
+        self.facing_angle = math.degrees(math.atan2(ty, tx))
 
         # ----------------------------------------------------
         # BUILD TRANSLATION MATRIX
@@ -138,9 +153,10 @@ class Player:
         """
         Draw the player triangle using Bresenham lines.
 
-        The three triangle vertices are defined relative to
-        center (0, 0) and then translated to (self.x, self.y)
-        using the translation matrix.
+        Full Phase 3 transformation chain applied per frame:
+          1. scaling_matrix  — body pulses bigger + turns red when detected
+          2. rotation_matrix — triangle faces the last movement direction
+          3. translation_matrix — moves local origin to world position
         """
 
         ix = int(round(self.x))
@@ -148,33 +164,67 @@ class Player:
 
         # -----------------------------------------------
         # DEFINE TRIANGLE VERTICES (relative to origin)
+        # Tip points RIGHT (+x) so rotation_matrix can
+        # freely orient it in any direction.
         # -----------------------------------------------
 
         local_pts = [
-            (0,  -8),    # Tip
-            (-7,  6),    # Bottom-left
-            (7,   6),    # Bottom-right
+            (8.0,   0.0),    # Tip  (right)
+            (-6.0, -6.0),   # Top-left
+            (-6.0,  6.0),   # Bottom-left
         ]
 
         # -----------------------------------------------
-        # APPLY TRANSLATION MATRIX to move from
-        # local origin → world position (self.x, self.y)
+        # STEP 1 — SCALING MATRIX
+        #
+        # When an enemy detects the player the triangle
+        # pulses between 1.0× and 1.5× via a sine wave,
+        # demonstrating scaling_matrix in live gameplay.
+        # -----------------------------------------------
+
+        if self.is_detected:
+            pulse = 0.25 * math.sin(pygame.time.get_ticks() * 0.008)
+            scale = 1.25 + pulse          # oscillates 1.0 – 1.5
+            draw_color = (220, 50, 50)    # red tint on alert
+        else:
+            scale      = 1.0
+            draw_color = (255, 255, 255)  # white when safe
+
+        S         = scaling_matrix(scale, scale)
+        scaled    = apply_transformation(S, local_pts, rep_type)
+
+        # -----------------------------------------------
+        # STEP 2 — ROTATION MATRIX
+        #
+        # Rotate the scaled vertices to face the current
+        # movement direction (self.facing_angle updated in
+        # update() from atan2 of the input vector).
+        # -----------------------------------------------
+
+        R       = rotation_matrix(self.facing_angle, rep_type)
+        rotated = apply_transformation(R, scaled, rep_type)
+
+        # -----------------------------------------------
+        # STEP 3 — TRANSLATION MATRIX
+        #
+        # Move rotated+scaled vertices from local origin
+        # to the player's world position.
         # -----------------------------------------------
 
         T   = translation_matrix(self.x, self.y, rep_type)
-        pts = apply_transformation(T, local_pts, rep_type)
+        pts = apply_transformation(T, rotated, rep_type)
 
         p1 = (int(round(pts[0][0])), int(round(pts[0][1])))
         p2 = (int(round(pts[1][0])), int(round(pts[1][1])))
         p3 = (int(round(pts[2][0])), int(round(pts[2][1])))
 
         # Draw triangle edges via Bresenham
-        bresenham_line(screen, p1[0], p1[1], p2[0], p2[1], (255, 255, 255))
-        bresenham_line(screen, p2[0], p2[1], p3[0], p3[1], (255, 255, 255))
-        bresenham_line(screen, p3[0], p3[1], p1[0], p1[1], (255, 255, 255))
+        bresenham_line(screen, p1[0], p1[1], p2[0], p2[1], draw_color)
+        bresenham_line(screen, p2[0], p2[1], p3[0], p3[1], draw_color)
+        bresenham_line(screen, p3[0], p3[1], p1[0], p1[1], draw_color)
 
         # Draw shield circle
-        bresenham_circle(screen, ix, iy, self.shield_radius, (255, 255, 255))
+        bresenham_circle(screen, ix, iy, self.shield_radius, draw_color)
 
 
 # ============================================================
@@ -223,19 +273,48 @@ class Enemy:
 
 
     # ========================================================
+    # WALL COLLISION CHECK  (same corner logic as Player)
+    # ========================================================
+
+    def _collides(self, px, py, game_map):
+        """
+        4-corner AABB collision check against the map grid.
+        Identical approach to Player._collides.
+        """
+        margin = 8   # slightly smaller than player's 10
+
+        for cx, cy in [
+            (px - margin, py - margin),
+            (px + margin, py - margin),
+            (px - margin, py + margin),
+            (px + margin, py + margin),
+        ]:
+            col = int(cx // CELL_SIZE)
+            row = int(cy // CELL_SIZE)
+            if game_map.is_wall(row, col):
+                return True
+
+        return False
+
+
+    # ========================================================
     # UPDATE PATROL MOVEMENT  (TRANSLATION MATRIX)
     #
     # Each frame we build a translation matrix for
     # a small step toward the current waypoint,
     # apply it to (self.x, self.y), then check if we've
     # reached the waypoint and reverse direction.
+    # Wall collision is now checked per-axis (sliding)
+    # and direction is reversed if completely blocked.
     # ========================================================
 
-    def update_patrol(self, rep_type):
+    def update_patrol(self, rep_type, game_map):
         """
-        Move enemy along patrol path using Translation Matrix.
+        Move enemy along patrol path using Translation Matrix
+        with wall collision detection.
 
-        rep_type : 1 = Row, 2 = Column
+        rep_type  : 1 = Row, 2 = Column
+        game_map  : GameMap instance for wall checking
         """
 
         # Target waypoint
@@ -274,8 +353,25 @@ class Enemy:
         # (phase3core.cpp: applyTransformation)
         # --------------------------------------------------
 
-        result   = apply_transformation(T, [(self.x, self.y)], rep_type)
-        self.x, self.y = result[0]
+        result       = apply_transformation(T, [(self.x, self.y)], rep_type)
+        new_x, new_y = result[0]
+
+        # --------------------------------------------------
+        # WALL COLLISION  (per-axis sliding, same as Player)
+        # If both axes are blocked, reverse patrol direction.
+        # --------------------------------------------------
+
+        blocked_x = self._collides(new_x, self.y, game_map)
+        blocked_y = self._collides(self.x, new_y, game_map)
+
+        if not blocked_x:
+            self.x = new_x
+        if not blocked_y:
+            self.y = new_y
+
+        # If completely stuck against a wall, flip patrol direction
+        if blocked_x and blocked_y:
+            self.patrol_going_b = not self.patrol_going_b
 
 
     # ========================================================
@@ -397,9 +493,9 @@ class Enemy:
         The FOV cone rays are computed similarly.
         """
 
-        ix     = int(round(self.x))
-        iy     = int(round(self.y))
-        color  = (255, 255, 255)
+        ix    = int(round(self.x))
+        iy    = int(round(self.y))
+        color = (255, 255, 255)
 
         # -----------------------------------------------
         # TRIANGLE BODY
@@ -417,17 +513,29 @@ class Enemy:
         ]
 
         # -----------------------------------------------
-        # 1. ROTATE local vertices to facing angle
+        # STEP 1 — SCALING MATRIX
+        #
+        # When this enemy detects the player, scale the
+        # body up to 1.3× to give a visual alert cue.
+        # Demonstrates scaling_matrix in live gameplay.
         # -----------------------------------------------
 
-        R = rotation_matrix(self.facing_angle, rep_type)
-        rotated_body = apply_transformation(R, local_body, rep_type)
+        scale = 1.3 if self.is_player_detected else 1.0
+        S     = scaling_matrix(scale, scale)
+        scaled_body = apply_transformation(S, local_body, rep_type)
 
         # -----------------------------------------------
-        # 2. TRANSLATE to world position
+        # STEP 2 — ROTATION MATRIX
         # -----------------------------------------------
 
-        T = translation_matrix(self.x, self.y, rep_type)
+        R            = rotation_matrix(self.facing_angle, rep_type)
+        rotated_body = apply_transformation(R, scaled_body, rep_type)
+
+        # -----------------------------------------------
+        # STEP 3 — TRANSLATION MATRIX
+        # -----------------------------------------------
+
+        T          = translation_matrix(self.x, self.y, rep_type)
         world_body = apply_transformation(T, rotated_body, rep_type)
 
         p0 = (int(round(world_body[0][0])), int(round(world_body[0][1])))

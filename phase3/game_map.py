@@ -266,7 +266,10 @@ class GameMap:
 
         screen.fill(BG_COLOR)
 
+        # Lock surface for bulk pixel-level drawing (set_at is slow without this)
+        screen.lock()
         self.draw_walls_dda(screen)
         self.draw_crates(screen)
         self.draw_coins_bresenham(screen)
         self.draw_health_kits(screen)
+        screen.unlock()
